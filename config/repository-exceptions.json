@@ -1,0 +1,4 @@
+{
+  "luci-app-homeproxy": "The VIKING TUN/AI fork has different configuration and features from upstream HomeProxy.",
+  "luci-i18n-homeproxy-zh-cn": "Translations must match the preinstalled VIKING HomeProxy fork."
+}
