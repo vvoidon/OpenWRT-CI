@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
+# CI_RUST_ROOT is inside TOPDIR and included in portable build baselines.
 
 # Keep OpenWrt's normal host stamps, without source download or bootstrap.
 PKG_SOURCE:=

@@ -7,11 +7,14 @@ set -euo pipefail
 REPORT_DIR="${GITHUB_WORKSPACE:-$PWD}/build-reports"
 mkdir -p "$REPORT_DIR"
 
-git rev-parse HEAD > "$REPORT_DIR/source-commit.txt"
+git rev-parse HEAD > "$REPORT_DIR/source-commit.txt" 2> "$REPORT_DIR/source-metadata-errors.txt" || true
 if [ -f .config ]; then
 	cp .config "$REPORT_DIR/config.txt"
 fi
-./scripts/feeds list -fs > "$REPORT_DIR/feeds.buildinfo"
+./scripts/feeds list -fs > "$REPORT_DIR/feeds.buildinfo" || true
+if [ -f ./host-toolchains/manifest.json ]; then
+	cp ./host-toolchains/manifest.json "$REPORT_DIR/host-toolchains.json"
+fi
 
 REPORT_PATHS=$(make --no-print-directory -s -f - TOPDIR="$PWD" ci-report-paths <<'MAKE'
 include $(TOPDIR)/rules.mk
@@ -33,7 +36,7 @@ for TIME_LOG in "$REPORT_DIR"/*.tsv; do
 done
 
 if [ -x ./staging_dir/host/bin/ccache ]; then
-	./staging_dir/host/bin/ccache -s > "$REPORT_DIR/ccache.txt"
+	./staging_dir/host/bin/ccache -s > "$REPORT_DIR/ccache.txt" || true
 fi
 
 if [ -x "$RUST_BIN/rustc" ]; then
