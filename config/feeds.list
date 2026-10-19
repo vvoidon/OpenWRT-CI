@@ -1,0 +1,5 @@
+# name|GitHub repository|branch (HEAD follows the default branch at check time)
+packages|immortalwrt/packages|HEAD
+luci|immortalwrt/luci|HEAD
+routing|openwrt/routing|HEAD
+telephony|openwrt/telephony|HEAD

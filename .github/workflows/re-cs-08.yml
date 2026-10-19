@@ -1,0 +1,554 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 VIKINGYFY
+
+name: JDCloud RE-CS-08
+
+on:
+  schedule:
+    # 每天北京时间 05:21 检查；仅额外插件变化时尝试只更新软件源，手动可强制完整构建。
+    - cron: '21 21 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制完整构建并发布固件（关闭后按变更类型自动分流）'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: re-cs-08-firmware
+  cancel-in-progress: false
+
+env:
+  WRT_CONFIG: re-cs-08
+  WRT_THEME: aurora
+  WRT_NAME: OWRT
+  WRT_IP: 192.168.10.1
+  WRT_PW: 无
+  WRT_REPO: https://github.com/VIKINGYFY/immortalwrt.git
+  WRT_BRANCH: owrt
+  WRT_SOURCE: VIKINGYFY/immortalwrt
+  WRT_APK_REPO: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/snapshots
+
+jobs:
+  check:
+    name: Check RE-CS-08 source changes
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.source-check.outputs.should_build }}
+      fingerprint: ${{ steps.source-check.outputs.fingerprint }}
+      reason: ${{ steps.source-check.outputs.reason }}
+      build_mode: ${{ steps.source-check.outputs.build_mode }}
+    steps:
+      - name: Checkout CI configuration
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Test build automation
+        run: python3 -B -m unittest discover -s tests -v
+
+      - name: Download previous successful source state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/previous-state"
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          echo "BASELINE_TAG=$latest_tag" >> "$GITHUB_ENV"
+          if [[ -n "$latest_tag" ]]; then
+            gh release download "$latest_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern source-state.txt \
+              --dir "$RUNNER_TEMP/previous-state" \
+              --clobber || true
+            gh release download "$latest_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern source-coverage.json \
+              --dir "$RUNNER_TEMP/previous-state" \
+              --clobber || true
+          fi
+          # Repository-only deployments keep the firmware Release immutable.
+          # Use Pages state only when it belongs to that same firmware baseline.
+          base="${WRT_APK_REPO%/snapshots}"
+          mkdir -p "$RUNNER_TEMP/pages-state"
+          if curl -fsSL --retry 3 "$base/repositories.json?run=$GITHUB_RUN_ID" \
+              -o "$RUNNER_TEMP/pages-state/repositories.json" &&
+              jq -e --arg tag "$latest_tag" '.baseline_tag == $tag and $tag != ""' \
+                "$RUNNER_TEMP/pages-state/repositories.json" >/dev/null &&
+              curl -fsSL --retry 3 "$base/source-state.txt?run=$GITHUB_RUN_ID" \
+                -o "$RUNNER_TEMP/pages-state/source-state.txt" &&
+              curl -fsSL --retry 3 "$base/source-coverage.json?run=$GITHUB_RUN_ID" \
+                -o "$RUNNER_TEMP/pages-state/source-coverage.json"; then
+            # The state hash must match the deployment metadata before reuse.
+            actual=$(sha256sum "$RUNNER_TEMP/pages-state/source-state.txt" | awk '{print $1}')
+            expected=$(jq -r '.fingerprint' "$RUNNER_TEMP/pages-state/repositories.json")
+            coverage_actual=$(sha256sum "$RUNNER_TEMP/pages-state/source-coverage.json" | awk '{print $1}')
+            coverage_expected=$(jq -r '.source_coverage_sha256' "$RUNNER_TEMP/pages-state/repositories.json")
+            if [[ "$actual" == "$expected" && "$coverage_actual" == "$coverage_expected" ]]; then
+              cp "$RUNNER_TEMP/pages-state/"source-{state.txt,coverage.json} "$RUNNER_TEMP/previous-state/"
+            fi
+          fi
+
+      - name: Check tracked source revisions
+        id: source-check
+        env:
+          FORCE_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          PREVIOUS_SOURCE_STATE: ${{ runner.temp }}/previous-state/source-state.txt
+          SOURCE_STATE_FILE: ${{ runner.temp }}/current-state/source-state.txt
+        run: |
+          ./scripts/check-sources.sh
+          printf '%s\n' "$BASELINE_TAG" > "$RUNNER_TEMP/current-state/baseline-tag.txt"
+
+      - name: Show decision
+        env:
+          BUILD_DECISION: ${{ steps.source-check.outputs.should_build }}
+          BUILD_REASON: ${{ steps.source-check.outputs.reason }}
+          BUILD_MODE: ${{ steps.source-check.outputs.build_mode }}
+          SOURCE_FINGERPRINT: ${{ steps.source-check.outputs.fingerprint }}
+        run: |
+          echo "Build: $BUILD_DECISION"
+          echo "Mode: $BUILD_MODE"
+          echo "Reason: $BUILD_REASON"
+          echo "Fingerprint: $SOURCE_FINGERPRINT"
+
+      - name: Upload source state
+        if: steps.source-check.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: re-cs-08-source-state
+          path: ${{ runner.temp }}/current-state/
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build firmware and APK repositories
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      build_mode: ${{ steps.publish-mode.outputs.build_mode }}
+    env:
+      SOURCE_FINGERPRINT: ${{ needs.check.outputs.fingerprint }}
+      APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+      SOURCE_STATE_FILE: ${{ github.workspace }}/build-state/source-state.txt
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - name: Checkout CI configuration
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download source state
+        uses: actions/download-artifact@v8
+        with:
+          name: re-cs-08-source-state
+          path: ./build-state
+
+      - name: Initialize build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo -E apt-get -yqq update
+          sudo -E apt-get -yqq install libfuse-dev
+          sudo bash -c 'bash <(curl -fsSL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo timedatectl set-timezone Asia/Shanghai
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown "$USER:$USER" /mnt/build_wrt
+          sudo ln -s /mnt/build_wrt "$GITHUB_WORKSPACE/wrt"
+
+      - name: Initialize build values
+        run: |
+          set -euo pipefail
+          WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[^=_]+(?==y)' "./config/$WRT_CONFIG.config")
+          WRT_SUBTARGET=$(grep -m 1 -oP "^CONFIG_TARGET_${WRT_TARGET}_\K[^=_]+(?==y)" "./config/$WRT_CONFIG.config")
+          WRT_HASH=$(awk -F'|' '$1 == "VIKINGYFY/immortalwrt" && $2 == "owrt" { print $4; exit }' ./build-state/source-state.txt)
+          [[ "$WRT_HASH" =~ ^[0-9a-f]{40}$ ]]
+
+          WRT_CACHE_SOURCE=${WRT_SOURCE//\//-}
+          WRT_CACHE_BRANCH=${WRT_BRANCH//\//-}
+          WRT_CACHE_TARGET="$WRT_TARGET-$WRT_SUBTARGET"
+          WRT_CACHE_PREFIX="wrt-v2-ubuntu24.04-${{ runner.arch }}-$WRT_CACHE_SOURCE-$WRT_CACHE_BRANCH-$WRT_CACHE_TARGET"
+
+          {
+            echo "WRT_INFO=${WRT_SOURCE%%/*}"
+            echo "WRT_MARK=${GITHUB_REPOSITORY%%/*}"
+            echo "WRT_DATE=$(date +'%y.%m.%d-%H.%M.%S')"
+            echo "WRT_CACHE_PREFIX=$WRT_CACHE_PREFIX"
+            echo "WRT_CCACHE_KEY=$WRT_CACHE_PREFIX-ccache-$SOURCE_FINGERPRINT"
+            echo "WRT_CACHE_TARGET=$WRT_CACHE_TARGET"
+            echo "WRT_SUBTARGET=$WRT_SUBTARGET"
+            echo "WRT_TARGET=$WRT_TARGET"
+            echo "WRT_HASH=$WRT_HASH"
+          } >> "$GITHUB_ENV"
+
+      - name: Clone firmware source at checked revision
+        run: |
+          set -euo pipefail
+          source ./scripts/common.sh
+          git -C ./wrt init
+          git -C ./wrt remote add origin "$WRT_REPO"
+          retry git -C ./wrt fetch --no-tags --depth=1 origin "$WRT_HASH"
+          git -C ./wrt checkout --detach FETCH_HEAD
+
+          PROJECT_MIRRORS_FILE="./wrt/scripts/projectsmirrors.json"
+          if [[ -f "$PROJECT_MIRRORS_FILE" ]]; then
+            sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
+          fi
+
+      - name: Restore persistent APK signing key
+        run: |
+          set -euo pipefail
+          : "${APK_SIGNING_KEY:?Repository secret APK_SIGNING_KEY is required}"
+          umask 077
+          printf '%s\n' "$APK_SIGNING_KEY" > ./wrt/private-key.pem
+          openssl ec -in ./wrt/private-key.pem -check -noout
+          openssl ec -in ./wrt/private-key.pem -pubout -out ./wrt/public-key.pem
+          chmod 600 ./wrt/private-key.pem
+          chmod 644 ./wrt/public-key.pem
+
+      - name: Calculate native-tool cache key
+        run: |
+          key=$(python3 ./scripts/source_inputs.py cache-key --root ./wrt --state "$SOURCE_STATE_FILE")
+          echo "WRT_TOOLS_KEY=$WRT_CACHE_PREFIX-tools-$key" >> "$GITHUB_ENV"
+
+      - name: Restore native tools
+        id: tools-cache
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ env.WRT_TOOLS_KEY }}
+          path: |
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
+
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ env.WRT_CCACHE_KEY }}
+          restore-keys: ${{ env.WRT_CACHE_PREFIX }}-ccache-
+          path: ./wrt/.ccache
+
+      - name: Prepare restored cache
+        if: steps.tools-cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          find ./wrt/staging_dir -type d -name stamp -not -path '*target*' | while read -r directory; do
+            find "$directory" -type f -exec touch {} +
+          done
+          mkdir -p ./wrt/tmp
+          echo 1 > ./wrt/tmp/.build
+
+      - name: Update enabled feeds
+        working-directory: ./wrt
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/scripts/common.sh"
+          python3 "$GITHUB_WORKSPACE/scripts/source_inputs.py" pin-feeds --state "$SOURCE_STATE_FILE"
+          retry ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Install selected external packages
+        working-directory: ./wrt
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/scripts/prepare-packages.sh"
+          python3 "$GITHUB_WORKSPACE/scripts/source_inputs.py" verify --state "$SOURCE_STATE_FILE"
+          "$GITHUB_WORKSPACE/scripts/patch-packages.sh"
+
+      - name: Configure RE-CS-08
+        working-directory: ./wrt
+        run: |
+          set -euo pipefail
+          cat "$GITHUB_WORKSPACE/config/$WRT_CONFIG.config" "$GITHUB_WORKSPACE/config/packages.config" >> .config
+          "$GITHUB_WORKSPACE/scripts/configure-firmware.sh"
+          make defconfig -j"$(nproc)"
+          python3 "$GITHUB_WORKSPACE/scripts/prune_packages.py"
+          make defconfig -j"$(nproc)"
+          python3 "$GITHUB_WORKSPACE/scripts/prune_packages.py" --check
+          python3 "$GITHUB_WORKSPACE/scripts/validate_packages.py" config
+          python3 "$GITHUB_WORKSPACE/scripts/source_inputs.py" footprint \
+            --state "$SOURCE_STATE_FILE" --output "$GITHUB_WORKSPACE/build-state/source-coverage.json"
+
+          [[ $(grep -Ec '^CONFIG_TARGET_DEVICE_.*=y$' .config) -eq 1 ]]
+          grep -q '^CONFIG_TARGET_DEVICE_qualcommbe_ipq53xx_DEVICE_jdcloud_re-cs-08=y$' .config
+          grep -q '^CONFIG_ALL_NONSHARED=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-app-axonhub=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-app-homeproxy=y$' .config
+          grep -q '^CONFIG_LUCI_LANG_zh_Hans=y$' .config
+          for package in kmod-tls kmod-bonding proto-bonding; do
+            grep -q "^CONFIG_PACKAGE_${package}=y$" .config
+          done
+          for feature in CGROUPS NAMESPACES SECCOMP; do
+            grep -q "^CONFIG_KERNEL_${feature}=y$" .config
+          done
+          for package in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn; do
+            grep -q "^CONFIG_PACKAGE_${package}=y$" .config
+          done
+          if grep -Eq '^CONFIG_PACKAGE_(kmod-ipt-rtpengine|iptables-mod-rtpengine|rtpengine|rtpengine-no-transcode|rtpengine-recording)=[ym]$' .config; then
+            echo "Unsupported RTPengine packages were selected" >&2
+            exit 1
+          fi
+          make clean -j"$(nproc)"
+
+      - name: Download packages
+        working-directory: ./wrt
+        run: make download -j"$(nproc)"
+
+      - name: Compile firmware and repositories
+        working-directory: ./wrt
+        run: make -j"$(nproc)" || make -j1 V=s
+
+      - name: Save native tools
+        if: success() && steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          key: ${{ env.WRT_TOOLS_KEY }}
+          path: |
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
+
+      - name: Save compiler cache
+        if: success() && steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          key: ${{ env.WRT_CCACHE_KEY }}
+          path: ./wrt/.ccache
+
+      - name: Prepare released firmware baseline
+        id: baseline
+        if: needs.check.outputs.build_mode == 'repository'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(<./build-state/baseline-tag.txt)
+          test -n "$tag"
+          mkdir baseline-downloads
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*sysupgrade*.bin' --pattern SHA256SUMS --dir baseline-downloads
+          python3 ./scripts/repository_update.py unpack ./baseline-downloads ./baseline \
+            ./wrt/staging_dir/host/bin/unsquashfs4
+
+      - name: Select publication mode and validate released firmware compatibility
+        id: publish-mode
+        env:
+          REQUESTED_MODE: ${{ needs.check.outputs.build_mode }}
+          BASELINE_READY: ${{ steps.baseline.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mode=firmware
+          if [[ "$REQUESTED_MODE" == repository && "$BASELINE_READY" == true ]]; then
+            image=$(find ./baseline-downloads -name '*sysupgrade*.bin' -type f)
+            if BASELINE_FIRMWARE_ROOT="$GITHUB_WORKSPACE/baseline/firmware" \
+                ./scripts/build-repositories.sh ./wrt ./wrt/pages &&
+                python3 ./scripts/validate_release.py ./wrt ./wrt/pages \
+                  --report ./build-state/release-validation.json &&
+                python3 ./scripts/validate_release.py ./wrt ./wrt/pages \
+                --baseline-image "$image" --report ./build-state/repository-validation.json; then
+              mode=repository
+            else
+              echo '::warning::Released firmware compatibility failed; publishing a full firmware build instead.'
+            fi
+          fi
+          if [[ "$mode" == firmware ]]; then
+            if [[ -e ./wrt/pages ]]; then
+              mv ./wrt/pages ./wrt/pages-baseline-rejected
+            fi
+            if [[ -e ./wrt/pages.audit ]]; then
+              mv ./wrt/pages.audit ./wrt/pages-baseline-rejected.audit
+            fi
+            ./scripts/build-repositories.sh ./wrt ./wrt/pages
+            python3 ./scripts/validate_release.py ./wrt ./wrt/pages \
+              --report ./build-state/release-validation.json
+          fi
+          echo "build_mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Publication mode: $mode" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$mode" == repository ]]; then
+            tag=$(<./build-state/baseline-tag.txt)
+          else
+            tag="RE-CS-08-$WRT_DATE"
+          fi
+          coverage_hash=$(sha256sum ./build-state/source-coverage.json | awk '{print $1}')
+          jq --arg tag "$tag" --arg mode "$mode" --arg coverage "$coverage_hash" \
+            '. + {baseline_tag: $tag, publication_mode: $mode, source_coverage_sha256: $coverage}' ./wrt/pages/repositories.json \
+            > ./wrt/pages/repositories.json.tmp
+          mv ./wrt/pages/repositories.json.tmp ./wrt/pages/repositories.json
+          cp ./build-state/source-state.txt ./build-state/source-coverage.json ./wrt/pages/
+
+      - name: Package firmware release
+        if: steps.publish-mode.outputs.build_mode == 'firmware'
+        working-directory: ./wrt
+        run: |
+          set -euo pipefail
+          mkdir -p ./release/assets
+          cp -f .config "./release/assets/config-$WRT_CONFIG-$WRT_INFO-$WRT_BRANCH-$WRT_DATE.config"
+          cp -f public-key.pem ./release/assets/public-key.pem
+          cp -f "$GITHUB_WORKSPACE/build-state/source-state.txt" ./release/assets/source-state.txt
+          cp -f "$GITHUB_WORKSPACE/build-state/source-coverage.json" ./release/assets/
+          cp -f "$GITHUB_WORKSPACE/build-state/release-validation.json" ./release/assets/
+          cp -f ./pages/repositories.json ./release/assets/
+          cp -f ./pages/repository-policy.json ./release/assets/
+
+          WRT_KVER=$(find ./bin/targets -type f -name '*.manifest' -exec grep -oP '^kernel - \K[\d.]+' {} \; | sort -u | paste -sd, -)
+          WRT_LIST=$(find ./bin/targets -type f -name '*.manifest' -exec grep -oP '^luci-(app|theme)[^ ]*' {} \; | sort -u | paste -sd' ' -)
+
+          while IFS= read -r -d '' file; do
+            base=$(basename "$file")
+            extension=${base#*.}
+            name=$(sed -nE "s/^.*($WRT_TARGET.*)\..*$/\1/p" <<< "$base")
+            [[ -n "$name" ]] || continue
+            cp "$file" "./release/assets/$name-$WRT_INFO-$WRT_BRANCH-$WRT_DATE.$extension"
+          done < <(find "./bin/targets/$WRT_TARGET/$WRT_SUBTARGET" -maxdepth 1 -type f \
+            \( -name '*re-cs-08*factory.bin' -o -name '*re-cs-08*sysupgrade.bin' -o -name '*.manifest' \) -print0)
+          [[ $(find ./release/assets -type f -name '*re-cs-08*.bin' | wc -l) -eq 2 ]]
+          (cd ./release/assets &&
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' |
+              LC_ALL=C sort -z | xargs -0 sha256sum > ../SHA256SUMS &&
+            mv ../SHA256SUMS ./SHA256SUMS)
+
+          echo "RE-CS-08-$WRT_DATE" > ./release/tag.txt
+          cat > ./release/body.md <<EOF
+          京东云 RE-CS-08 专用固件与同次构建的 APK 软件源。
+
+          源码：$WRT_REPO
+          分支：$WRT_BRANCH
+          提交：$WRT_HASH
+          构建输入指纹（Source-Fingerprint）：$SOURCE_FINGERPRINT
+
+          平台：$WRT_TARGET/$WRT_SUBTARGET
+          内核 ABI：$WRT_ABI
+          内核版本：$WRT_KVER
+          软件源包数（不代表固件预装数量）：
+          - 平台软件包：$WRT_TARGET_PACKAGE_COUNT
+          - 内核模块（kmod）：$WRT_KMOD_PACKAGE_COUNT
+          - 补充软件包：$WRT_CUSTOM_PACKAGE_COUNT
+          软件源策略：优先复用兼容的官方包，仅托管缺失/不兼容的包；详见 repository-policy.json
+          插件源更新策略：仅额外插件仓库变化且通过兼容性校验时，只更新软件源，不发布新固件；软件包版本号沿用上游。
+          发布前验证：APK 签名、公钥、内核 ABI、官方包兼容性、预装包完整性、Docker 安装及插件重装的依赖解析（模拟安装）
+
+          默认管理地址：$WRT_IP
+          默认登录密码：$WRT_PW
+          首次登录后请修改密码；保留配置升级时，以设备现有设置为准。
+
+          自建 APK 软件源：$WRT_APK_REPO
+          固件与自建软件源仅保留最新版本；旧固件的软件包可用性不作保证，kmod 必须匹配内核 ABI。
+          固件预装 LuCI 插件与主题（按实际构建清单生成，不含命令行工具、依赖库及翻译包）：
+          $WRT_LIST
+          EOF
+
+      - name: Package repository-only validation metadata
+        if: steps.publish-mode.outputs.build_mode == 'repository'
+        run: |
+          mkdir -p ./wrt/release/assets
+          cp ./wrt/pages/repositories.json ./wrt/pages/repository-policy.json ./wrt/release/assets/
+          cp ./build-state/source-state.txt ./build-state/source-coverage.json \
+            ./build-state/repository-validation.json ./wrt/release/assets/
+
+      - name: Show machine and output information
+        working-directory: ./wrt
+        run: |
+          lscpu | grep -E 'name|Core|Thread' || true
+          df -h
+          du -h --max-depth=1 ./pages ./release
+
+      - name: Upload publication metadata and optional firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: re-cs-08-firmware-release
+          path: ./wrt/release
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: ./wrt/pages
+          include-hidden-files: true
+          retention-days: 1
+
+  deploy:
+    name: Deploy APK repositories
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout verification scripts
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download validation metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: re-cs-08-firmware-release
+          path: ./release
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6.0.0
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1
+
+      - name: Verify deployed repositories before releasing firmware
+        run: |
+          python3 ./scripts/verify_published.py ./release/assets/repositories.json \
+            "${WRT_APK_REPO%/snapshots}"
+
+  release:
+    name: Publish firmware release
+    needs: [check, build, deploy]
+    if: needs.build.outputs.build_mode == 'firmware' && needs.deploy.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware release artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: re-cs-08-firmware-release
+          path: ./release
+
+      - name: Read release tag
+        run: echo "RELEASE_TAG=$(<./release/tag.txt)" >> "$GITHUB_ENV"
+
+      - name: Publish firmware
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.RELEASE_TAG }}
+          body_path: ./release/body.md
+          files: ./release/assets/*
+          fail_on_unmatched_files: true
+          make_latest: true
+
+      - name: Keep only the latest firmware release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Only remove old downloads after the new release is published.
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' > "$RUNNER_TEMP/release-tags.txt"
+          while IFS= read -r tag; do
+            [[ "$tag" == "$RELEASE_TAG" ]] && continue
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+          done < "$RUNNER_TEMP/release-tags.txt"

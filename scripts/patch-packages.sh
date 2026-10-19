@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 
@@ -21,11 +21,6 @@ FIX() {
 		echo "$NAME fix failed; continuing!"
 	fi
 }
-
-#修改argon主题字体和颜色
-FIX "theme-argon" "$PACKAGE_PATH/luci-theme-argon" sed -i \
-	"s/primary '.*'/primary '#31a1a1'/g; s/'0.2'/'0.5'/g; s/'none'/'bing'/g; s/'600'/'normal'/g" \
-	"$PACKAGE_PATH/luci-theme-argon/luci-app-argon-config/root/etc/config/argon"
 
 #修改aurora菜单式样
 FIX "theme-aurora" "$PACKAGE_PATH/luci-app-aurora-config" find \
