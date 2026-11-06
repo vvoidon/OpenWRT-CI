@@ -1,69 +1,26 @@
-# 高质量<免费>交流群
+# 京东云 RE-CS-08 固件
 
-[IPQ技术讨论群](https://qm.qq.com/q/v7nMhzB4oU)
+基于 [VIKINGYFY/OpenWRT-CI](https://github.com/VIKINGYFY/OpenWRT-CI)，使用 ImmortalWrt `owrt` 分支，提供 RE-CS-08 固件和配套 APK 软件源。
 
-# 高质量<付费>中转站
+[固件下载](https://github.com/vvoidon/OpenWRT-CI/releases) · [软件源](https://vvoidon.github.io/OpenWRT-CI/)
 
-[LiBwrt-Ai](https://api.zipimg.cn/register?aff=FFPS3UMJ8HJD)
+默认管理地址：`192.168.10.1`，默认无密码，首次登录后请设置密码。
 
-# 本地编译器
+## 使用
 
-https://github.com/VIKINGYFY/OWRT-Tools.git
+1. 配置 Actions Secret `APK_SIGNING_KEY`，内容为固定 EC 私钥的 PEM 文本，勿将私钥提交到仓库。
+2. 将仓库 Pages 的 Source 设置为 **GitHub Actions**。
+3. 在 **Actions → JDCloud RE-CS-08 → Run workflow** 启动构建。`force=true` 强制完整构建，`false` 按源码变化决定是否构建。
 
-# 自用修改版插件
+每天北京时间 05:21 自动检查更新，GitHub 调度可能延迟。用户态包符合条件时增量更新软件源，失败则回退完整构建。可选软件源包失败时跳过，固件必需包和发布检查仍须成功；跳过清单见 Release 附件 `package-failures.json`。
 
-https://github.com/VIKINGYFY/packages.git
+软件源更新不会自动更新设备上的包。软件源与固件仅保留最新版本，旧固件的软件包可用性不作保证，kmod 必须匹配内核 ABI。`build-baseline*` 仅供 CI 使用，不是刷机文件。
 
-# OpenWRT-CI
+## 配置
 
-官方版：
+- `config/re-cs-08.config`：设备配置
+- `config/re-cs-08-kernel.config`：内核配置
+- `config/packages.config`：软件包选择
+- `scripts/prepare-packages.sh`：外部插件来源
 
-https://github.com/immortalwrt/immortalwrt.git
-
-自用版：
-
-https://github.com/VIKINGYFY/immortalwrt.git
-
-# U-BOOT
-
-高通版-沉心：
-
-https://github.com/chenxin527/uboot-qsdk12.5-build.git
-
-高通版-小猪：
-
-https://github.com/1980490718/u-boot-2016.git
-
-联发科-全新版：
-
-https://github.com/VIKINGYFY/UBOOT-CI/releases
-
-联发科-官方版：
-
-https://drive.wrt.moe/uboot/mediatek
-
-# 固件简要说明
-
-固件每天早上5点自动编译。
-
-固件信息里的时间为编译开始的时间，方便核对上游源码提交时间。
-
-MEDIATEK系列、QUALCOMMAX系列、ROCKCHIP系列、X86系列。
-
-# 目录简要说明
-
-workflows——自定义CI配置
-
-Scripts——自定义脚本
-
-Config——自定义配置
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=vikingyfy%2Fopenwrt-ci&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vikingyfy/openwrt-ci&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vikingyfy/openwrt-ci&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vikingyfy/openwrt-ci&type=date&legend=top-left" />
- </picture>
-</a>
+本地检查：`python3 -B -m unittest discover -s tests -v`。构建日志和失败详情见 Actions 及其报告附件。
