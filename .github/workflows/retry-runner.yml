@@ -1,0 +1,26 @@
+name: Recover disconnected build runner
+
+on:
+  workflow_run:
+    workflows: [JDCloud RE-CS-08]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+  checks: read
+
+jobs:
+  recover:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Retry once when GitHub reports a disconnected runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B ./scripts/retry_failed_runner.py
